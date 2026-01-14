@@ -1,5 +1,9 @@
-import mongoose from 'mongoose';
+import mongoose from 'mongoose'; //librería mongoose
 
+/*
+ * Defino esquema (estructura) para la colección de usuarios.
+ * El esquema actúa como un filtro que valida los datos antes de guardarlos.
+ */
 const userSchema = new mongoose.Schema({
     first_name: { type: String, required: true },
     last_name: { type: String, required: true },
