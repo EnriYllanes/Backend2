@@ -1,71 +1,110 @@
 import { Router } from 'express';
-import { userModel } from '../models/user.model.js';
-// Importamos el modelo de carritos para poder crear uno al registrar el usuario
-import { cartModel } from '../models/cart.model.js'; 
-import { createHash, isValidPassword, generateToken } from '../utils.js';
 import passport from 'passport';
+import { userService } from '../repositories/index.js';
+import UserDTO from '../dto/user.dto.js';
+import jwt from 'jsonwebtoken';
+import config from '../config/config.js';
+import { createHash, isValidPassword } from '../utils/hashPassword.js';
+import { sendRecoveryEmail } from '../utils/mailer.js';
 
 const router = Router();
 
-// --- RUTA DE REGISTRO ---
-router.post('/register', async (req, res) => {
-    const { first_name, last_name, email, age, password } = req.body;
-    try {
-        // Verificamos si el email ya está en uso
-        const exists = await userModel.findOne({ email });
-        if (exists) return res.status(400).send({ status: "error", error: "User already exists" });
-
-        // 1. CREACIÓN DEL CARRITO: Generamos un carrito vacío en la DB para este usuario
-        const newCart = await cartModel.create({ products: [] });
-
-        // 2. CREACIÓN DEL USUARIO: Vinculamos el ID del carrito recién creado
-        const newUser = {
-            first_name,
-            last_name,
-            email,
-            age,
-            password: createHash(password), // Encriptación solicitada
-            cart: newCart._id,              // Referencia al ID del carrito
-            role: 'user'
-        };
-
-        const result = await userModel.create(newUser);
-        res.status(201).send({ status: "success", message: "User registered", payload: result._id });
-    } catch (error) {
-        res.status(500).send({ status: "error", error: "Error al registrar usuario" });
-    }
+/**
+ * REGISTRO
+ */
+router.post('/register', passport.authenticate('register', { session: false }), async (req, res) => {
+    res.send({ status: "success", message: "User registered" });
 });
 
-// --- RUTA DE LOGIN ---
-router.post('/login', async (req, res) => {
-    const { email, password } = req.body;
-    try {
-        // Buscamos al usuario por email
-        const user = await userModel.findOne({ email });
-        if (!user) return res.status(401).send({ status: "error", error: "Invalid credentials" });
+/**
+ * LOGIN
+ */
+router.post('/login', passport.authenticate('login', { session: false }), async (req, res) => {
+    if (!req.user) return res.status(400).send({ status: "error", error: "Invalid credentials" });
 
-        // Validamos la contraseña usando el método compare de bcrypt
-        if (!isValidPassword(user, password)) return res.status(401).send({ status: "error", error: "Invalid credentials" });
+    const token = jwt.sign({ 
+        user: { 
+            id: req.user._id, 
+            email: req.user.email, 
+            role: req.user.role 
+        } 
+    }, config.jwtSecret, { expiresIn: '24h' });
 
-        // Generamos el Token JWT (usando la función de utils.js)
-        const token = generateToken(user);
-
-        // Enviamos el token al navegador mediante una Cookie segura (httpOnly)
-        res.cookie('coderCookieToken', token, { 
-            maxAge: 60 * 60 * 1000, // 1 hora de duración
-            httpOnly: true          // Protege contra ataques XSS
-        }).send({ status: "success", message: "Logged in" });
-
-    } catch (error) {
-        res.status(500).send({ status: "error", error: "Error en el proceso de login" });
-    }
+    res.cookie('coderCookieToken', token, {
+        maxAge: 60 * 60 * 1000 * 24,
+        httpOnly: true 
+    }).send({ status: "success", payload: new UserDTO(req.user) });
 });
 
-// --- RUTA CURRENT (CONSIGNA) ---
-// passport.authenticate('jwt') valida automáticamente el token de la cookie
+/**
+ * CURRENT
+ */
 router.get('/current', passport.authenticate('jwt', { session: false }), (req, res) => {
-    // Si el token es válido, Passport coloca los datos del usuario en req.user
-    res.send({ status: "success", payload: req.user });
+    const userDto = new UserDTO(req.user);
+    res.send({ status: "success", payload: userDto });
+});
+
+/**
+ * SOLICITAR RECUPERACIÓN
+ */
+router.post('/password-reset-request', async (req, res) => {
+    const { email } = req.body;
+    try {
+        // CORRECCIÓN: Usamos getUser({ email }) que es el método real de tu repository
+        const user = await userService.getUser({ email }); 
+        
+        if (!user) {
+            return res.status(404).send({ status: "error", error: "Usuario no encontrado" });
+        }
+        
+        const resetToken = jwt.sign({ email }, config.jwtSecret, { expiresIn: '1h' });
+        
+        await sendRecoveryEmail(email, resetToken);
+        res.send({ status: "success", message: "Recovery email sent" });
+        
+    } catch (error) {
+        console.error("❌ Error en reset-request:", error.message);
+        res.status(500).send({ status: "error", error: error.message });
+    }
+});
+
+/**
+ * RESTABLECER CONTRASEÑA
+ */
+router.post('/password-reset', async (req, res) => {
+    const { token, newPassword } = req.body;
+
+    try {
+        const decoded = jwt.verify(token, config.jwtSecret);
+        const email = decoded.email;
+
+        // CORRECCIÓN: Usamos getUser({ email })
+        const user = await userService.getUser({ email });
+        if (!user) return res.status(404).send({ status: "error", error: "User not found" });
+
+        // Validar que no sea la misma contraseña
+        if (isValidPassword(user, newPassword)) {
+            return res.status(400).send({ 
+                status: "error", 
+                message: "No puedes usar la misma contraseña anterior" 
+            });
+        }
+
+        const hashedPassword = createHash(newPassword);
+        
+        // CORRECCIÓN: Usamos el método updatePassword de tu repository si lo prefieres,
+        // o el método genérico de actualización. Aquí usamos el updatePassword que ya creaste:
+        await userService.updatePassword(email, hashedPassword);
+
+        res.send({ status: "success", message: "Password updated successfully" });
+
+    } catch (error) {
+        if (error.name === 'TokenExpiredError') {
+            return res.status(400).send({ status: "error", error: "El token ha expirado. Solicita uno nuevo." });
+        }
+        console.error("❌ Error en password-reset:", error.message);
+        res.status(500).send({ status: "error", error: "Token inválido o error interno" });
+    }
 });
 
 export default router;
